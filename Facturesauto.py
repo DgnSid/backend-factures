@@ -2,19 +2,15 @@ import pandas as pd
 from datetime import datetime
 import os
 import re
-import asyncio
+from weasyprint import HTML, CSS
 import io
-import json
-import sys
-import time
-from pyppeteer import launch
-import pyppeteer
+import urllib.request
 import cloudinary
 import cloudinary.uploader
 import cloudinary.api
 import requests
-
-pyppeteer.chromium_downloader.download_chromium = lambda *args, **kwargs: None
+import json
+import sys
 
 # ==============================
 # ⚙️ CONFIG CLOUDINARY
@@ -31,11 +27,16 @@ CLOUDINARY_BASE_FOLDER = "factures"
 CLOUDINARY_BDD_FOLDER = "BDD"  # Dossier où se trouve donnees.xlsx
 
 # ==============================
-# ⚙️ CONFIG LOCALE TEMPORAIRE
+# ⚙️ CONFIG LOCALE
 # ==============================
+FICHIER_EXCEL = "donnees.xlsx"
+DOSSIER_SORTIE = "factures"
+DOSSIER_HTML = "factures_html"
 DOSSIER_TEMP = "temp_factures"
 DOSSIER_HTML_TEMP = "temp_html"
 
+os.makedirs(DOSSIER_SORTIE, exist_ok=True)
+os.makedirs(DOSSIER_HTML, exist_ok=True)
 os.makedirs(DOSSIER_TEMP, exist_ok=True)
 os.makedirs(DOSSIER_HTML_TEMP, exist_ok=True)
 
@@ -126,6 +127,9 @@ def send_summary(total_clients, factures_generees, duree, mois_annee):
     sys.stdout.flush()
 
 # ==============================
+# 🔍 CHARGEMENT DES DONNÉES
+# ==============================
+
 # 🔧 INITIALISATION CLOUDINARY
 # ==============================
 def initialiser_cloudinary():
@@ -137,8 +141,11 @@ def initialiser_cloudinary():
             api_secret=CLOUDINARY_CONFIG["api_secret"],
             secure=CLOUDINARY_CONFIG["secure"]
         )
+        print("✅ Cloudinary initialisé avec succès")
+        tracker.update(1, 5, "initializing", "Cloudinary initialisé")
         return True
     except Exception as e:
+        print(f"❌ Erreur d'initialisation Cloudinary: {e}")
         tracker.set_error(f"Erreur d'initialisation Cloudinary: {e}")
         return False
 
@@ -149,10 +156,9 @@ def telecharger_excel_depuis_cloudinary():
     """
     Télécharge le fichier Excel depuis Cloudinary en utilisant l'API de recherche.
     """
-    import io
-    import requests
     try:
         print(f"📥 Recherche du fichier Excel dans le dossier 'BDD'...")
+        tracker.update(2, 5, "loading", "Recherche fichier Excel sur Cloudinary")
         
         # Utiliser l'API de recherche pour trouver des fichiers bruts dans le dossier 'BDD'
         resultats = cloudinary.Search() \
@@ -212,6 +218,7 @@ def telecharger_excel_depuis_cloudinary():
         print(f"❌ Erreur lors du téléchargement Excel depuis Cloudinary: {e}")
         import traceback
         traceback.print_exc()
+        tracker.set_error(f"Erreur téléchargement Excel: {e}")
         return None
 
 def uploader_vers_cloudinary(chemin_fichier, nom_client, mois_annee=None, sous_dossier=""):
@@ -269,6 +276,13 @@ def uploader_vers_cloudinary(chemin_fichier, nom_client, mois_annee=None, sous_d
         
         print(f"   ✅ Fichier téléversé avec succès")
         
+        # Ajouter l'URL au tracker
+        tracker.add_result_url({
+            'client': nom_client,
+            'url': resultat.get('secure_url'),
+            'type': sous_dossier if sous_dossier else 'document'
+        })
+        
         # Supprimer le fichier temporaire local après téléversement
         if os.path.exists(chemin_fichier):
             os.remove(chemin_fichier)
@@ -284,168 +298,101 @@ def uploader_vers_cloudinary(chemin_fichier, nom_client, mois_annee=None, sous_d
         
     except Exception as e:
         print(f"   ❌ Erreur téléversement Cloudinary: {e}")
+        tracker.set_error(f"Erreur upload {nom_client}: {e}")
         # Ne pas supprimer en cas d'erreur
         return {'success': False, 'error': str(e)}
 
-def lister_contenu_dossier_cloudinary(dossier=""):
-    """Liste le contenu d'un dossier Cloudinary"""
-    try:
-        prefix = f"{dossier}/" if dossier else ""
-        
-        resultats = cloudinary.api.resources(
-            type="upload",
-            prefix=prefix,
-            max_results=100
-        )
-        
-        if 'resources' in resultats and resultats['resources']:
-            print(f"\n📁 Contenu de '{dossier if dossier else 'racine'}':")
-            
-            # Organiser par type
-            fichiers_pdf = []
-            fichiers_html = []
-            fichiers_excel = []
-            autres = []
-            
-            for res in resultats['resources']:
-                fichier_info = {
-                    'nom': res['public_id'],
-                    'format': res.get('format', 'N/A'),
-                    'taille': f"{res.get('bytes', 0)/1024:.1f}KB",
-                    'date': res.get('created_at', 'N/A')
-                }
-                
-                if res.get('format') == 'pdf':
-                    fichiers_pdf.append(fichier_info)
-                elif res.get('format') == 'html' or 'html' in res['public_id'].lower():
-                    fichiers_html.append(fichier_info)
-                elif res.get('format') in ['xlsx', 'xls']:
-                    fichiers_excel.append(fichier_info)
-                else:
-                    autres.append(fichier_info)
-            
-            if fichiers_excel:
-                print(f"\n📊 Fichiers Excel ({len(fichiers_excel)}):")
-                for f in fichiers_excel:
-                    print(f"   • {f['nom']} ({f['format']}, {f['taille']})")
-            
-            if fichiers_pdf:
-                print(f"\n📄 Factures PDF ({len(fichiers_pdf)}):")
-                for f in fichiers_pdf[:5]:  # Afficher seulement les 5 premiers
-                    print(f"   • {f['nom']} ({f['taille']})")
-                if len(fichiers_pdf) > 5:
-                    print(f"   ... et {len(fichiers_pdf) - 5} autres")
-            
-            if fichiers_html:
-                print(f"\n🌐 Fichiers HTML ({len(fichiers_html)}):")
-                for f in fichiers_html[:3]:
-                    print(f"   • {f['nom']} ({f['taille']})")
-                if len(fichiers_html) > 3:
-                    print(f"   ... et {len(fichiers_html) - 3} autres")
-            
-            return resultats
-        else:
-            print(f"\n📁 Dossier '{dossier}' vide ou inexistant")
+# ==============================
+# 🔍 CHARGEMENT DES DONNÉES
+# ==============================
+
+def charger_donnees():
+    """Charge et nettoie les données Excel"""
+    print("🔍 Recherche de la position des données...")
+    tracker.update(3, 5, "loading", "Chargement des données")
+    
+    # Résoudre le fichier de données (priorité: Cloudinary > BDD/donnees.xlsx > DATA_URL > défaut)
+    def _download_file(url, dest_path):
+        try:
+            print(f"🔽 Téléchargement depuis: {url}")
+            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+            urllib.request.urlretrieve(url, dest_path)
+            print(f"✅ Téléchargé vers: {dest_path}")
+            return dest_path
+        except Exception as e:
+            print(f"❌ Erreur téléchargement: {e}")
             return None
-            
-    except Exception as e:
-        print(f"❌ Erreur listing Cloudinary: {e}")
-        return None
 
-def creer_dossier_cloudinary(dossier_path):
-    """Crée un dossier sur Cloudinary (simulation)"""
-    try:
-        # Cloudinary n'a pas de vraie API pour créer des dossiers
-        # On va créer un fichier vide pour "marquer" le dossier
-        nom_fichier_temp = "temp_marker.txt"
-        chemin_temp = os.path.join(DOSSIER_TEMP, nom_fichier_temp)
+    def _resolve_data_file():
+        # Essayer Cloudinary en priorité (sans réinitialiser)
+        try:
+            df_cloud = telecharger_excel_depuis_cloudinary()
+            if df_cloud is not None:
+                return "cloudinary", df_cloud
+        except Exception as e:
+            print(f"⚠️  Pas de fichier Cloudinary trouvé: {e}")
         
-        with open(chemin_temp, 'w') as f:
-            f.write("Dossier créé automatiquement")
+        # Fallback sur fichier local
+        data_url = os.environ.get('DATA_URL')
+        bdd_path = os.path.join('BDD', 'donnees.xlsx')
         
-        resultat = cloudinary.uploader.upload(
-            chemin_temp,
-            folder=dossier_path,
-            public_id=".folder_marker",
-            overwrite=False,
-            tags=["dossier_marker"]
-        )
+        if data_url:
+            dl = _download_file(data_url, bdd_path)
+            if dl:
+                return "url", dl
         
-        os.remove(chemin_temp)
-        print(f"✅ Dossier créé/marqué: {dossier_path}")
-        return True
+        if os.path.exists(bdd_path):
+            print(f"ℹ️ Utilisation du fichier local: {bdd_path}")
+            return "local", bdd_path
         
-    except Exception as e:
-        print(f"⚠️  Impossible de créer le dossier: {e}")
-        return False
+        if os.path.exists(FICHIER_EXCEL):
+            print(f"ℹ️ Utilisation du fichier local: {FICHIER_EXCEL}")
+            return "local", FICHIER_EXCEL
+        
+        print(f"⚠️ Aucun fichier de données trouvé, utilisation par défaut: {FICHIER_EXCEL}")
+        return "default", FICHIER_EXCEL
 
-# ==============================
-# 🔍 CHARGEMENT DES DONNÉES DEPUIS CLOUDINARY
-# ==============================
-def charger_donnees_depuis_cloudinary():
-    """Charge et nettoie les données Excel depuis Cloudinary"""
-    print("\n🔍 Chargement des données depuis Cloudinary...")
+    source, fichier_a_lire = _resolve_data_file()
     
-    # Télécharger le DataFrame depuis Cloudinary
-    df_complet = telecharger_excel_depuis_cloudinary()
+    # Si c'est un DataFrame (de Cloudinary), l'utiliser directement
+    if isinstance(fichier_a_lire, pd.DataFrame):
+        df_complet = fichier_a_lire
+    else:
+        # Sinon, lire le fichier Excel
+        df_complet = pd.read_excel(fichier_a_lire, header=None)
     
-    if df_complet is None or len(df_complet) == 0:
-        print("❌ Impossible de charger les données depuis Cloudinary")
-        return pd.DataFrame()
-    
-    print("🔍 Recherche de la position des données dans le fichier...")
-    
-    # Recherche de la ligne contenant "Noms"
     ligne_titre = None
-    for i in range(min(50, len(df_complet))):  # Chercher dans les 50 premières lignes
-        for j in range(min(10, len(df_complet.columns))):  # Et les 10 premières colonnes
+    for i in range(len(df_complet)):
+        for j in range(len(df_complet.columns)):
             valeur_cellule = str(df_complet.iloc[i, j]).strip()
             if valeur_cellule.lower() == "noms":
                 ligne_titre = i
-                print(f"✅ 'Noms' trouvé à la position : Ligne {i+1}, Colonne {j+1}")
+                print(f"✅ 'Noms' trouvé à la position : Ligne {i}")
                 break
         if ligne_titre is not None:
             break
     
     if ligne_titre is None:
-        print("⚠️  'Noms' non trouvé, tentative de détection automatique...")
-        # Essayer de trouver une ligne avec des en-têtes
-        for i in range(min(20, len(df_complet))):
-            # Vérifier si cette ligne contient plusieurs mots (probables en-têtes)
-            nb_mots = sum(1 for j in range(min(10, len(df_complet.columns))) 
-                         if isinstance(df_complet.iloc[i, j], str) and len(df_complet.iloc[i, j].split()) > 0)
-            if nb_mots >= 3:  # Au moins 3 colonnes avec du texte
-                ligne_titre = i
-                print(f"📝 Ligne {i+1} détectée comme en-têtes (contient {nb_mots} colonnes avec texte)")
-                break
-    
-    if ligne_titre is None:
-        print("❌ Impossible de détecter les en-têtes, utilisation ligne 10 par défaut")
-        ligne_titre = 9  # Ligne 10 en index 0-based
-    
-    # Charger les données à partir de la ligne d'en-têtes
-    try:
-        df = pd.DataFrame(df_complet.iloc[ligne_titre+1:].values, columns=df_complet.iloc[ligne_titre])
-    except:
-        print("⚠️  Erreur lors de la création du DataFrame, tentative alternative...")
-        df = df_complet.iloc[ligne_titre+1:].copy()
-        df.columns = df_complet.iloc[ligne_titre].tolist()
+        print("❌ 'Noms' non trouvé, utilisation ligne 9 par défaut")
+        ligne_titre = 9
+
+    # Charger les données
+    # Si c'est un DataFrame depuis Cloudinary, l'utiliser directement
+    if isinstance(fichier_a_lire, pd.DataFrame):
+        df = fichier_a_lire.iloc[ligne_titre:].reset_index(drop=True)
+        df.columns = df.iloc[0]
+        df = df[1:].reset_index(drop=True)
+    else:
+        df = pd.read_excel(fichier_a_lire, skiprows=ligne_titre, header=0)
     
     # Nettoyer les colonnes
     colonnes_a_garder = []
     for col in df.columns:
         col_str = str(col)
-        if 'unnamed' not in col_str.lower() and not col_str.startswith('Unnamed') and not pd.isna(col):
+        if 'unnamed' not in col_str.lower() and not col_str.startswith('Unnamed'):
             colonnes_a_garder.append(col)
     
-    if colonnes_a_garder:
-        df = df[colonnes_a_garder]
-    else:
-        print("⚠️  Aucune colonne valide trouvée, utilisation de toutes les colonnes")
-    
-    print("\n📋 Colonnes originales trouvées :")
-    for col in df.columns:
-        print(f"  - '{col}'")
+    df = df[colonnes_a_garder]
     
     # Nettoyer les noms de colonnes
     df.columns = (
@@ -453,127 +400,104 @@ def charger_donnees_depuis_cloudinary():
         .astype(str)
         .str.strip()
         .str.lower()
-        .str.replace('\xa0', ' ', regex=False)
-        .str.replace(' ', '_', regex=False)
-        .str.replace('é', 'e', regex=False)
-        .str.replace('è', 'e', regex=False)
-        .str.replace('à', 'a', regex=False)
-        .str.replace('(', '', regex=False)
-        .str.replace(')', '', regex=False)
-        .str.replace('-', '_', regex=False)
+        .str.replace('\xa0', ' ')
+        .str.replace(' ', '_')
+        .str.replace('é', 'e')
+        .str.replace('è', 'e')
+        .str.replace('à', 'a')
+        .str.replace('(', '')
+        .str.replace(')', '')
+        .str.replace('-', '_')
+        .str.replace('__', '_')
     )
     
-    print("\n📋 Colonnes après nettoyage :")
-    for col in df.columns:
-        print(f"  - '{col}'")
-    
     # Supprimer les lignes vides
-    if 'noms' in df.columns:
-        df = df.dropna(subset=['noms'])
-        df = df.reset_index(drop=True)
-    else:
-        print("\n⚠️  Colonne 'noms' non trouvée après nettoyage !")
-        print("   Tentative de trouver une colonne similaire...")
-        
-        colonnes_similaires = [col for col in df.columns if 'nom' in col.lower()]
-        if colonnes_similaires:
-            print(f"   Colonnes similaires trouvées: {colonnes_similaires}")
-            df = df.dropna(subset=[colonnes_similaires[0]])
-            df = df.reset_index(drop=True)
-            print(f"   Utilisation de '{colonnes_similaires[0]}' comme colonne noms")
-        else:
-            print("❌ Aucune colonne 'nom' trouvée")
-            print("   Colonnes disponibles:", list(df.columns))
-            return pd.DataFrame()
+    df = df.dropna(subset=['noms'])
+    df = df.reset_index(drop=True)
     
-    print(f"\n📊 {len(df)} clients trouvés")
-    
-    # Sauvegarder un extrait localement pour debug (optionnel)
-    chemin_debug = os.path.join(DOSSIER_TEMP, "debug_data.csv")
-    df.head(10).to_csv(chemin_debug, index=False, encoding='utf-8')
-    print(f"📝 Extrait sauvegardé pour debug: {chemin_debug}")
-    
+    print(f"📊 {len(df)} clients trouvés")
     return df
 
 # ==============================
-# 🎯 TEMPLATE HTML (inchangé)
+# 🎯 NOUVEAU TEMPLATE HTML OPTIMISÉ
 # ==============================
+
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
 <style>
 body {
-  margin-left: 5%;
-  margin-right: 5%;
+  margin:0;
   padding: 20px;
   font-family: Arial, sans-serif;
   background-color: #f5f5f5;
+  font-size: 13px; /* réduit d'environ 3px par rapport au défaut */
 }
 .facture-container {
   width: 85%;
   margin: 0 auto;
   background-color: white;
-    padding: 24px;
+  padding: 36px; /* légèrement réduit */
   box-shadow: 0 0 10px rgba(0,0,0,0.1);
 }
 .header-title {
-    border: 3px solid #333;
-    padding: 10px;
-    text-align: center;
-    margin-bottom: 12px;
-    background-color: #f9f9f9;
+  border: 3px solid #333;
+  padding: 12px;
+  text-align: center;
+  margin-bottom: 18px;
+  background-color: #f9f9f9;
 }
 .header-title h1 {
-    margin: 0;
-    font-size: 13px;
-    font-weight: bold;
-    color: #000;
+  margin: 0;
+  font-size: 15px; /* 18 -> 15 */
+  font-weight: bold;
+  color: #000;
 }
 .company-card {
-    border: 3px solid #333;
-    padding: 10px;
-    margin-bottom: 12px;
-    background-color: #fafafa;
+  border: 3px solid #333;
+  padding: 16px;
+  margin-bottom: 18px;
+  background-color: #fafafa;
 }
 .company-card p {
-    margin: 4px 0;
-    font-size: 8pt;
-    line-height: 1.25;
+  margin: 6px 0;
+  font-size: 11px; /* ~11pt -> 11px */
+  line-height: 1.35;
 }
 .company-card h2 {
-    margin: 0 0 8px 0;
-    font-size: 10pt;
-    font-weight: bold;
+  margin: 0 0 10px 0;
+  font-size: 14px; /* ~13pt -> 14px */
+  font-weight: bold;
 }
 .info-card {
-    border: 2px solid #333;
-    padding: 10px;
-    margin-bottom: 12px;
-    background-color: #fafafa;
+  border: 2px solid #333;
+  padding: 12px;
+  margin-bottom: 18px;
+  background-color: #fafafa;
 }
 .info-card p {
-    margin: 3px 0;
-    font-size: 8pt;
+  margin: 5px 0;
+  font-size: 11px; /* ~11pt -> 11px */
 }
 .info-card strong {
   font-weight: bold;
 }
 .table-container {
-    margin: 12px 0;
-    overflow-x: auto;
+  margin: 16px 0;
+  overflow-x: auto;
 }
 table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 7pt;
-    margin-bottom: 10px;
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 10px; /* ~10pt -> 10px */
+  margin-bottom: 12px;
 }
 table td, table th {
-    border: 0.5pt solid #000;
-    padding: 4px 2px;
-    text-align: center;
-    vertical-align: top;
+  border: 0.5pt solid #000;
+  padding: 6px; /* réduit pour gagner de l'espace */
+  text-align: center;
+  vertical-align: top;
 }
 table th {
   background-color: #f0f0f0;
@@ -583,31 +507,30 @@ table td:first-child, table th:first-child {
   text-align: left;
 }
 .banking-card {
-    border: 2px solid #333;
-    padding: 10px;
-    background-color: #fafafa;
-    margin-top: 12px;
+  border: 2px solid #333;
+  padding: 12px;
+  background-color: #fafafa;
+  margin-top: 18px;
 }
 .banking-card h3 {
-    margin: 0 0 8px 0;
-    font-size: 8pt;
-    font-weight: bold;
+  margin: 0 0 10px 0;
+  font-size: 11px; /* ~11pt -> 11px */
+  font-weight: bold;
 }
 .banking-card p {
-    margin: 3px 0;
-    font-size: 8pt;
+  margin: 5px 0;
+  font-size: 11px;
 }
 .banking-card strong {
   font-weight: bold;
 }
 .footer {
-    margin-top: 10px;
-    padding-top: 10px;
-    border-top: 1px solid #ddd;
-    font-size: 7pt;
-    text-align: center;
-    color: #666;
-    line-height: 1.25;
+  margin-top: 24px;
+  padding-top: 16px;
+  border-top: 1px solid #ddd;
+  font-size: 9px; /* ~9pt -> 9px */
+  text-align: center;
+  color: #666;
 }
 </style>
 </head>
@@ -638,17 +561,16 @@ table td:first-child, table th:first-child {
 <table>
 <thead>
 <tr>
-<th colspan="2">TARIF MENSUEL</th>
-<th>TARIF HORAIRE</th>
-<th>TOTAL</th>
+<th colspan="4" style="text-align: center;">TARIF MENSUEL</th>
+
 </tr>
 </thead>
 <tbody>
 <tr>
 <td style="font-weight: bold;">A) SANS PRISE EN CHARGE</td>
 <td style="font-weight: bold;">NOMBRE D'HEURES</td>
-<td></td>
-<td></td>
+<td style="font-weight: bold;">TARIF HORAIRE</td>
+<td style="font-weight: bold;">TOTAL</td>
 </tr>
 <tr>
 <td>Prestation mensuelle (tous les jours sauf dimanche et férié)</td>
@@ -704,6 +626,7 @@ table td:first-child, table th:first-child {
 # ==============================
 # 🎯 GÉNÉRATION DES FACTURES HTML
 # ==============================
+
 def generer_facture_html(row, index):
     """Génère une facture HTML pour un client"""
     
@@ -711,35 +634,34 @@ def generer_facture_html(row, index):
     if not nom or pd.isna(nom) or str(nom).lower() == 'nan':
         return None
     
-    print(f"\n📄 Génération facture pour : {nom}")
+    print(f"📄 Génération facture pour : {nom}")
     
+    # Récupération des valeurs de base
     heures_totales = safe_float(
-        row.get('heures_semaine',
-               row.get('heures_totales', 0))
+      row.get('heures_semaine', row.get('heures_(semaine)', row.get('heures_totales', 0)))
     )
-    
     heures_ferie = safe_float(
-        row.get('heures_dimanches_et_feries',
-               0)
+      row.get('heures_dimanches_et_feries', row.get('heures_(dimanches_et_fériés)', row.get('heures_ferie', 0)))
     )
     
-    tarif_horaire = 24.58
-    tarif_ferie = 28.27
+    # Tarifs
+    tarif_horaire = safe_float(row.get('tarif_horaire_semaine_€/h', 24.58))
+    tarif_ferie = safe_float(row.get('tarif_horaire_ferie_€/h', 28.27))
     
+    # Calculs des totaux
     total_prescription = round(heures_totales * tarif_horaire, 2)
     total_ferie = round(heures_ferie * tarif_ferie, 2)
     total_sans_prise_charge = round(total_prescription + total_ferie, 2)
     
-    tarif_departement = 18.39
-    for col_name in ['prise_en_charge_departement_e_h', 'prise_en_charge_departement', 'tarif_departement']:
-        if col_name in row:
-            tarif_departement = safe_float(row[col_name], 18.18)
-            break
-    
+    # Participation du département
+    tarif_departement = safe_float(row.get('prise_en_charge_departement_€/h', 18.18))
     heures_total_accordees = heures_totales + heures_ferie
-    total_departement = safe_float(row.get('total_a_payer_par_le_departement_€', row.get('total_a_payer_par_le_departement_€', 0)))
-    reste_a_charge = safe_float(row.get('total_a_payer_par_le_client_ttc_€', row.get('total_a_payer_par_le_client_ttc€', 0)))
+    total_departement = round(tarif_departement * heures_total_accordees, 2)
     
+    # Reste à charge
+    reste_a_charge = safe_float(row.get('total_a_payer_par_le_client_ttc_€', row.get('total_a_payer_par_le_client__ttc_€', 0)))
+    
+    # Données de remplacement
     replacements = {
         '{{NOM_CLIENT}}': str(nom),
         '{{ADRESSE_CLIENT}}': str(row.get('adresse_complete', 'Adresse non fournie')),
@@ -758,31 +680,35 @@ def generer_facture_html(row, index):
         '{{RESTE_A_CHARGE}}': format_nombre(reste_a_charge)
     }
     
+    # Nettoyer les valeurs NaN
     for key, value in replacements.items():
         if str(value).lower() == 'nan' or value is None:
             replacements[key] = '0,00'
     
+    # Appliquer les remplacements
     html_content = HTML_TEMPLATE
     for placeholder, valeur in replacements.items():
         html_content = html_content.replace(placeholder, str(valeur))
     
+    # Sauvegarder le HTML
     nom_clean = re.sub(r'[<>:"/\\|?*]', '_', str(nom))
     nom_fichier_html = f"FACTURE_{nom_clean}.html"
-    chemin_html = os.path.join(DOSSIER_HTML_TEMP, nom_fichier_html)
+    chemin_html = os.path.join(DOSSIER_HTML, nom_fichier_html)
     
     with open(chemin_html, 'w', encoding='utf-8') as f:
         f.write(html_content)
     
-    print(f"✅ HTML généré temporairement: {chemin_html}")
-    return chemin_html, nom
+    print(f"   ✅ HTML généré : {chemin_html}")
+    return chemin_html
 
 def safe_float(value, default=0.0):
     """Convertit une valeur en float de manière sécurisée"""
     try:
         if pd.isna(value):
             return default
+        # Remplacer les virgules par des points pour la conversion
         if isinstance(value, str):
-            value = value.replace(',', '.').replace(' ', '').replace('€', '')
+            value = value.replace(',', '.')
         return float(value)
     except (ValueError, TypeError):
         return default
@@ -792,262 +718,129 @@ def format_nombre(value):
     try:
         if pd.isna(value):
             return "0,00"
+        # Assurer que c'est un float
         num = float(value)
+        # Formater avec 2 décimales et remplacer le point par une virgule
         return f"{num:,.2f}".replace(',', ' ').replace('.', ',').replace(' ', '.')
     except:
         return "0,00"
 
 # ==============================
-# 🚀 CONVERSION HTML VERS PDF (Pyppeteer)
+# 🚀 CONVERSION HTML VERS PDF
 # ==============================
-async def convertir_html_vers_pdf_async(chemin_html, nom_client):
-    """Convertit un fichier HTML en PDF avec Pyppeteer"""
-    try:
-        nom_clean = re.sub(r'[<>:"/\\|?*]', '_', str(nom_client))
-        nom_fichier_pdf = f"FACTURE_{nom_clean}_{datetime.now().strftime('%Y%m%d')}.pdf"
-        chemin_pdf_temp = os.path.join(DOSSIER_TEMP, nom_fichier_pdf)
-        
-        os.makedirs(os.path.dirname(chemin_pdf_temp), exist_ok=True)
-        
-        chrome_paths = [
-            "C:/Program Files/Google/Chrome/Application/chrome.exe",
-            "C:/Program Files (x86)/Google/Chrome/Application/chrome.exe",
-            os.environ.get('LOCALAPPDATA', '') + "/Google/Chrome/Application/chrome.exe",
-            os.environ.get('PROGRAMFILES', '') + "/Google/Chrome/Application/chrome.exe",
-            os.environ.get('PROGRAMFILES(X86)', '') + "/Google/Chrome/Application/chrome.exe"
-        ]
-        
-        chrome_executable = None
-        for path in chrome_paths:
-            if os.path.exists(path):
-                chrome_executable = path
-                break
-        
-        if chrome_executable:
-            browser = await launch(
-                executablePath=chrome_executable, 
-                headless=True,
-                args=['--no-sandbox', '--disable-setuid-sandbox']
-            )
-        else:
-            browser = await launch(
-                headless=True,
-                args=['--no-sandbox', '--disable-setuid-sandbox']
-            )
-        
-        page = await browser.newPage()
-        await page.setViewport({'width': 1240, 'height': 1754})
-        
-        html_path = os.path.abspath(chemin_html)
-        await page.goto(f'file:///{html_path}', waitUntil='networkidle2')
-        
-        pdf_options = {
-            'path': chemin_pdf_temp,
-            'format': 'A4',
-            'printBackground': True,
-            'margin': {
-                'top': '20mm',
-                'right': '15mm',
-                'bottom': '20mm',
-                'left': '15mm'
-            },
-            'preferCSSPageSize': True
-        }
-        
-        await page.pdf(pdf_options)
-        await browser.close()
-        
-        print(f"   ✅ PDF généré temporairement: {nom_fichier_pdf}")
-        return chemin_pdf_temp
-        
-    except Exception as e:
-        print(f"   ❌ Erreur conversion PDF: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
 
 def convertir_html_vers_pdf(chemin_html, nom_client):
-    """Wrapper synchrone pour la conversion PDF asynchrone"""
-    return asyncio.run(convertir_html_vers_pdf_async(chemin_html, nom_client))
-
-# ==============================
-# 🧹 NETTOYAGE DES FICHIERS TEMPORAIRES
-# ==============================
-def nettoyer_fichiers_temporaires():
-    """Supprime tous les fichiers temporaires"""
-    import shutil
+    """Convertit un fichier HTML en PDF en préservant le style"""
     try:
-        if os.path.exists(DOSSIER_TEMP):
-            shutil.rmtree(DOSSIER_TEMP)
-            os.makedirs(DOSSIER_TEMP, exist_ok=True)
-            print("✅ Dossier temporaire des PDF nettoyé")
+        # Lire le fichier HTML
+        with open(chemin_html, 'r', encoding='utf-8') as f:
+            html_content = f.read()
         
-        if os.path.exists(DOSSIER_HTML_TEMP):
-            shutil.rmtree(DOSSIER_HTML_TEMP)
-            os.makedirs(DOSSIER_HTML_TEMP, exist_ok=True)
-            print("✅ Dossier temporaire des HTML nettoyé")
-            
+        # Générer le PDF
+        chemin_pdf = chemin_html.replace('.html', '.pdf').replace(DOSSIER_HTML, DOSSIER_SORTIE)
+        
+        # Créer le répertoire s'il n'existe pas
+        os.makedirs(os.path.dirname(chemin_pdf), exist_ok=True)
+        
+        # Convertir HTML en PDF avec WeasyPrint
+        HTML(string=html_content).write_pdf(chemin_pdf)
+        print(f"   ✅ PDF généré : {chemin_pdf}")
+        
+        # Uploader le PDF vers Cloudinary
+        mois_annee = datetime.now().strftime("%Y-%m")
+        resultat_pdf = uploader_vers_cloudinary(chemin_pdf, nom_client, mois_annee, "pdf")
+        
+        if resultat_pdf['success']:
+            print(f"   ☁️  URL Cloudinary: {resultat_pdf['url']}")
+        
+        # Uploader aussi le HTML
+        resultat_html = uploader_vers_cloudinary(chemin_html, nom_client, mois_annee, "html")
+        
+        if resultat_html['success']:
+            print(f"   ☁️  HTML URL: {resultat_html['url']}")
+        
+        return chemin_pdf
+        
+    except ImportError:
+        print("   ⚠️  WeasyPrint non installé, installation...")
+        os.system("pip install weasyprint")
+        return convertir_html_vers_pdf(chemin_html, nom_client)
     except Exception as e:
-        print(f"⚠️  Erreur lors du nettoyage: {e}")
+        print(f"   ❌ Erreur conversion PDF: {e}")
+        return None
 
 # ==============================
 # 🎯 PROGRAMME PRINCIPAL
 # ==============================
+
 def main():
-    send_progress(0, 100, "starting", "Initialisation du système...", 0)
+    print("🚀 DÉMARRAGE GÉNÉRATION FACTURES")
+    print("=" * 50)
     
-    try:
-        # Initialiser Cloudinary
-        send_progress(5, 100, "loading", "Connexion à Cloudinary...", 5)
-        if not initialiser_cloudinary():
-            send_progress(0, 100, "error", "Échec de connexion à Cloudinary", 0, error="Cloudinary error")
-            return
-        
-        # Nettoyer les anciens fichiers
-        send_progress(10, 100, "loading", "Nettoyage des fichiers temporaires...", 10)
-        nettoyer_fichiers_temporaires()
-        
-        # Charger les données
-        send_progress(15, 100, "loading", "Chargement des données depuis Cloudinary...", 15)
-        df = charger_donnees_depuis_cloudinary()
-        
-        if len(df) == 0:
-            send_progress(0, 100, "error", "Aucune donnée à traiter", 0, error="No data")
-            return
-        
-        total_clients = len(df)
-        send_progress(20, 100, "processing", f"Début du traitement de {total_clients} clients", 20)
-        
-        mois_annee = datetime.now().strftime("%Y-%m")
-        factures_generees = 0
-        urls_result = []
-        start_time = datetime.now()
-        
-        # Traiter chaque client
-        for index, row in df.iterrows():
-            client_num = index + 1
-            # Progression linéaire: 20% -> 95% pour le traitement des clients
-            progress = 20 + int((client_num / total_clients) * 75)
-            
-            nom_client = str(row.get('noms', f'Client {client_num}')).strip()
-            send_progress(
-                client_num, 
-                total_clients, 
-                "generating", 
-                f"Génération pour: {nom_client}", 
-                progress
-            )
-            
-            try:
-                # Générer le HTML
-                resultat_html = generer_facture_html(row, index)
-                if not resultat_html:
-                    continue
-                    
-                chemin_html, nom_client = resultat_html
-                
-                # Convertir en PDF
-                chemin_pdf_temp = convertir_html_vers_pdf(chemin_html, nom_client)
-                if not chemin_pdf_temp:
-                    continue
-                
-                # Upload du PDF
-                resultat_pdf = uploader_vers_cloudinary(chemin_pdf_temp, nom_client, mois_annee)
-                if resultat_pdf.get('success'):
-                    factures_generees += 1
-                    urls_result.append({
-                        'client': nom_client,
-                        'url': resultat_pdf.get('url', '#'),
-                        'date': datetime.now().isoformat()
-                    })
-                    
-                    # Envoyer la mise à jour avec les URLs
-                    send_progress(
-                        client_num,
-                        total_clients,
-                        "uploading",
-                        f"✅ {nom_client} - Facture générée",
-                        progress,
-                        urls=urls_result
-                    )
-                
-                # Upload du HTML (optionnel)
-                uploader_vers_cloudinary(chemin_html, nom_client, mois_annee, "html")
-                
-            except Exception as e:
-                send_progress(
-                    client_num,
-                    total_clients,
-                    "error",
-                    f"Erreur pour {nom_client}: {str(e)}",
-                    progress,
-                    urls=urls_result,
-                    error=str(e)
-                )
+    start_time = datetime.now()
+    tracker.start_time = start_time
+    tracker.update(1, 5, "starting", "Initialisation en cours")
+    
+    # Initialiser Cloudinary
+    initialiser_cloudinary()
+    
+    # Charger les données
+    tracker.update(3, 5, "loading", "Chargement des données Excel")
+    df = charger_donnees()
+    
+    if len(df) == 0:
+        print("❌ Aucune donnée à traiter")
+        tracker.set_error("Aucune donnée à traiter")
+        return
+    
+    total_clients = len(df)
+    tracker.total_steps = total_clients + 5
+    
+    print(f"\n🎯 Génération des factures pour {total_clients} clients...")
+    tracker.update(4, total_clients + 5, "processing", f"Génération des factures pour {total_clients} clients")
+    
+    factures_generees = 0
+    mois_annee = datetime.now().strftime("%Y-%m")
+    
+    for index, row in df.iterrows():
+        try:
+            # Récupérer le nom du client
+            nom_client = row.get('noms', '')
+            if not nom_client or pd.isna(nom_client) or str(nom_client).lower() == 'nan':
                 continue
-        
-        # Finalisation
-        end_time = datetime.now()
-        duree = f"{(end_time - start_time).total_seconds():.1f}s"
-        
-        send_progress(
-            total_clients,
-            total_clients,
-            "completed",
-            f"✅ Génération terminée! {factures_generees} factures créées",
-            100,
-            urls=urls_result
-        )
-        
-        send_summary(total_clients, factures_generees, duree, mois_annee)
-        
-    except Exception as e:
-        send_progress(0, 100, "error", f"Erreur fatale: {str(e)}", 0, error=str(e))
-
-# ==============================
-# 🔧 FONCTIONS UTILITAIRES SUPPLEMENTAIRES
-# ==============================
-def tester_connexion_cloudinary():
-    """Teste la connexion à Cloudinary"""
-    print("🔧 Test de connexion Cloudinary...")
+            
+            # Mettre à jour la progression
+            current_step = 4 + index + 1
+            tracker.update(current_step, total_clients + 5, "processing", f"Génération facture: {nom_client}")
+            
+            # Générer le HTML
+            chemin_html = generer_facture_html(row, index)
+            
+            if chemin_html:
+                # Convertir en PDF et uploader vers Cloudinary
+                chemin_pdf = convertir_html_vers_pdf(chemin_html, nom_client)
+                if chemin_pdf:
+                    factures_generees += 1
+                    
+        except Exception as e:
+            print(f"❌ Erreur ligne {index}: {e}")
+            tracker.set_error(f"Erreur ligne {index}: {e}")
     
-    if not all([CLOUDINARY_CONFIG["cloud_name"], 
-                CLOUDINARY_CONFIG["api_key"], 
-                CLOUDINARY_CONFIG["api_secret"]]):
-        print("❌ Configuration Cloudinary incomplète")
-        print("Veuillez remplir les informations suivantes:")
-        print(f"   Cloud Name: {CLOUDINARY_CONFIG['cloud_name']}")
-        print(f"   API Key: {CLOUDINARY_CONFIG['api_key'][:10]}...")
-        print(f"   API Secret: {'*' * len(CLOUDINARY_CONFIG['api_secret']) if CLOUDINARY_CONFIG['api_secret'] else 'Non défini'}")
-        return False
+    # Finalisation
+    end_time = datetime.now()
+    duree = str(end_time - start_time).split('.')[0]
+    tracker.end_time = end_time
     
-    try:
-        initialiser_cloudinary()
-        
-        # Tester en listant les ressources
-        resultats = cloudinary.api.resources(
-            type="upload",
-            max_results=1
-        )
-        print("✅ Connexion Cloudinary réussie")
-        return True
-        
-    except Exception as e:
-        print(f"❌ Erreur de connexion Cloudinary: {e}")
-        return False
-
-def preparer_structure_cloudinary():
-    """Prépare la structure de dossiers sur Cloudinary"""
-    print("\n🔧 Préparation de la structure Cloudinary...")
+    print(f"\n📊 RÉCAPITULATIF:")
+    print(f"✅ Factures générées: {factures_generees}/{total_clients}")
+    print(f"📁 Dossier HTML: {os.path.abspath(DOSSIER_HTML)}")
+    print(f"📁 Dossier PDF: {os.path.abspath(DOSSIER_SORTIE)}")
+    print(f"⏱️  Durée: {duree}")
+    print("🎉 Terminé !")
     
-    # Créer les dossiers principaux
-    creer_dossier_cloudinary(CLOUDINARY_BDD_FOLDER)
-    creer_dossier_cloudinary(CLOUDINARY_BASE_FOLDER)
-    
-    print("\n📁 Structure Cloudinary prête:")
-    print(f"   • {CLOUDINARY_BDD_FOLDER}/ - Pour vos fichiers Excel")
-    print(f"   • {CLOUDINARY_BASE_FOLDER}/ - Pour les factures générées")
-    print(f"\n💡 Astuce: Uploader votre donnees.xlsx dans le dossier {CLOUDINARY_BDD_FOLDER}/")
+    # Envoyer le résumé
+    tracker.update(total_clients + 5, total_clients + 5, "completed", "Génération terminée")
+    send_summary(total_clients, factures_generees, duree, mois_annee)
 
 if __name__ == "__main__":
     main()
